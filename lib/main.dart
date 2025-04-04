@@ -44,9 +44,10 @@ class _MyHomePageState extends State<MyHomePage> {
   // WebSocket 채널
   StompClient? _stompClient;
 
-  List<RTCIceCandidate> _candidateBuffer = [];
+  // ICE 관련 상태 변수
   bool _remoteDescriptionSet = false;
-
+  bool _isGatheringIceCandidates = false;
+  bool _iceGatheringComplete = false;
 
   @override
   void initState() {
@@ -138,46 +139,95 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  // 신호 서버 연결 후 실행되는 함수
   void _onStompConnect(StompFrame frame) {
     print('신호 서버에 연결됨');
     setState(() => _connectionStatus = '신호 서버에 연결됨');
 
     try {
-      // 시그널링 메시지 수신 구독
+      // answer 수신을 위한 구독 설정
       _stompClient!.subscribe(
-        destination: "/topic/offer/1",
+        destination: "/topic/answer/1",
         callback: (StompFrame frame) {
-          print('offer 수신: ${frame.body}');
+          print('answer 수신: ${frame.body}');
           if (frame.body != null) {
             try {
               Map<String, dynamic> message = json.decode(frame.body!);
               _handleSignalingMessage(message);
             } catch (e) {
-              _logError('Offer 메시지 파싱 오류: $e');
-            }
-          }
-        },
-      );
-
-      _stompClient!.subscribe(
-        destination: "/topic/iceCandidate/1",
-        callback: (StompFrame frame) {
-          print('ICE 후보 수신: ${frame.body}');
-          if (frame.body != null) {
-            try {
-              Map<String, dynamic> message = json.decode(frame.body!);
-              _handleSignalingMessage(message);
-            } catch (e) {
-              _logError('ICE 메시지 파싱 오류: $e');
+              _logError('Answer 메시지 파싱 오류: $e');
             }
           }
         },
       );
 
       // WebRTC 연결 설정 시작
-      _createPeerConnection();
+      _createPeerConnection().then((_) {
+        // 연결 설정 후 즉시 offer 생성 및 전송
+        _createAndSendOffer();
+      });
     } catch (e) {
       _logError('구독 설정 오류: $e');
+    }
+  }
+
+  // offer 생성 및 전송 (ICE 수집 및 통합 방식 적용)
+  Future<void> _createAndSendOffer() async {
+    try {
+      if (_peerConnection == null) {
+        _logError('PeerConnection이 없습니다');
+        return;
+      }
+
+      setState(() {
+        _connectionStatus = 'Offer 생성 및 ICE 후보 수집 중...';
+        _isGatheringIceCandidates = true;
+      });
+
+      // offer 생성
+      RTCSessionDescription offer = await _peerConnection!.createOffer();
+      await _peerConnection!.setLocalDescription(offer);
+      print('임시 Offer 생성 완료');
+
+      // ICE 후보 수집 완료 대기 (타임아웃 설정)
+      int attemptCount = 0;
+      const maxAttempts = 200; // 최대 20초 대기 (1초 * 20)
+
+      while (!_iceGatheringComplete && attemptCount < maxAttempts) {
+        await Future.delayed(const Duration(milliseconds: 1000));
+        attemptCount++;
+        print('ICE 후보 수집 대기 중... ($attemptCount/$maxAttempts)');
+      }
+
+      // 최종 LocalDescription 가져오기 (완전한 SDP 포함)
+      RTCSessionDescription? completeOffer = await _peerConnection!.getLocalDescription();
+
+      if (completeOffer == null) {
+        throw Exception('최종 LocalDescription을 가져올 수 없습니다');
+      }
+
+      print('최종 Offer 생성 완료 (모든 ICE 후보 포함)');
+
+      if (_stompClient != null && _stompClient!.connected) {
+        print('완전한 Offer 전송 중...');
+
+        _stompClient!.send(
+          destination: '/app/offer/1',
+          body: json.encode({
+            'type': 'offer',
+            'offer': completeOffer.toMap(),
+            'id': '1'
+          }),
+        );
+
+        setState(() {
+          _connectionStatus = '완전한 Offer 전송됨, Answer 대기 중...';
+          _isGatheringIceCandidates = false;
+        });
+      }
+    } catch (e) {
+      _logError('Offer 생성 및 전송 오류: $e');
+      setState(() => _isGatheringIceCandidates = false);
     }
   }
 
@@ -189,17 +239,17 @@ class _MyHomePageState extends State<MyHomePage> {
       print('메시지 내용: $message');
 
       switch (type) {
-        case 'offer':
+        case 'answer':
           try {
-            print('Offer 메시지 원본: $message');
+            print('Answer 메시지 원본: $message');
 
-            // Offer SDP 추출
+            // Answer SDP 추출
             String? sdp;
-            if (message.containsKey('offer') && message['offer'] != null) {
-              Map<String, dynamic> offerObj = message['offer'];
-              if (offerObj.containsKey('sdp')) {
-                sdp = offerObj['sdp'];
-                print('Offer SDP 찾음: $sdp');
+            if (message.containsKey('answer') && message['answer'] != null) {
+              Map<String, dynamic> answerObj = message['answer'];
+              if (answerObj.containsKey('sdp')) {
+                sdp = answerObj['sdp'];
+                print('Answer SDP 찾음: $sdp');
               }
             }
 
@@ -210,7 +260,7 @@ class _MyHomePageState extends State<MyHomePage> {
             // RTCSessionDescription 생성
             RTCSessionDescription description = RTCSessionDescription(
                 sdp,
-                'offer'
+                'answer'
             );
 
             if (_peerConnection != null) {
@@ -218,65 +268,15 @@ class _MyHomePageState extends State<MyHomePage> {
               await _peerConnection!.setRemoteDescription(description);
               _remoteDescriptionSet = true;
 
-              // Answer 생성 및 전송
-              RTCSessionDescription answer = await _peerConnection!.createAnswer();
-              await _peerConnection!.setLocalDescription(answer);
-              print('Answer 생성 완료: ${answer.sdp}');
-
-              if (_stompClient != null && _stompClient!.connected) {
-                print('Answer 전송 중...');
-
-                // 맵으로 변환하여 전송
-                _stompClient!.send(
-                  destination: '/app/answer/1',
-                  body: json.encode({
-                    'type': 'answer',
-                    'answer': answer.toMap(),
-                  }),
-                );
-              }
-
-              // 버퍼에 쌓인 ICE 후보 처리
-              if (_candidateBuffer.isNotEmpty) {
-                print('${_candidateBuffer.length}개의 대기 중인 ICE 후보 처리');
-                for (var candidate in _candidateBuffer) {
-                  await _peerConnection!.addCandidate(candidate);
-                }
-                _candidateBuffer.clear();
-              }
+              setState(() {
+                _connectionStatus = 'Answer 수신됨, 연결 설정 중...';
+              });
             }
           } catch (e, stackTrace) {
             print('SDP 처리 중 상세 오류: $e');
             print('스택 트레이스: $stackTrace');
             print('오류 발생 시 메시지 구조: $message');
-            print(e);
             _logError('SDP 처리 오류: $e');
-          }
-          break;
-
-        case 'ice-candidate':
-          try {
-            print('ICE 후보 정보: ${message['candidate']}');
-            if (message['candidate'] != null) {
-              // ICE 후보 생성
-              RTCIceCandidate candidate = RTCIceCandidate(
-                message['candidate']['candidate'],
-                message['candidate']['sdpMid'],
-                message['candidate']['sdpMLineIndex'],
-              );
-
-              // 원격 설명이 설정되었는지 확인 후 처리
-              if (_remoteDescriptionSet && _peerConnection != null) {
-                print('ICE 후보 즉시 추가');
-                await _peerConnection!.addCandidate(candidate);
-              } else {
-                // 아직 원격 설명이 설정되지 않았으면 버퍼에 저장
-                print('ICE 후보 버퍼링 (원격 설명 대기 중)');
-                _candidateBuffer.add(candidate);
-              }
-            }
-          } catch (e) {
-            _logError('ICE 후보 처리 오류: $e');
           }
           break;
 
@@ -298,10 +298,15 @@ class _MyHomePageState extends State<MyHomePage> {
       // STUN 서버 설정
       Map<String, dynamic> configuration = {
         'iceServers': [
+          // {
+          //   'urls': [
+          //     "stun:stun.l.google.com:19302",
+          //   ]
+          // }
           {
-            'urls': [
-              "stun:stun.l.google.com:19302",
-            ]
+            'urls': Env.turnURL,
+            'username': Env.turnUsername,
+            'credential': Env.turnCredential
           }
         ]
       };
@@ -332,19 +337,22 @@ class _MyHomePageState extends State<MyHomePage> {
         }
       };
 
-      // ICE 후보 이벤트 처리
+      // ICE 후보 수집 상태 이벤트 처리
+      _peerConnection!.onIceGatheringState = (RTCIceGatheringState state) {
+        print('ICE 수집 상태 변경: $state');
+
+        if (state == RTCIceGatheringState.RTCIceGatheringStateComplete) {
+          print('ICE 후보 수집 완료');
+          setState(() {
+            _iceGatheringComplete = true;
+          });
+        }
+      };
+
+      // ICE 후보 이벤트 처리 (로깅용으로만 사용)
       _peerConnection!.onIceCandidate = (RTCIceCandidate candidate) {
         print('로컬 ICE 후보 발견: ${candidate.candidate}');
-        // ICE 후보를 신호 서버로 전송 (주의: 타입 이름이 웹과 일치하도록 변경)
-        if (_stompClient != null && _stompClient!.connected) {
-          _stompClient!.send(
-            destination: '/app/iceCandidate/1',
-            body: json.encode({
-              'type': 'ice-candidate', // 웹 버전과 일치하도록 'ice-candidate'로 변경
-              'candidate': candidate.toMap(),
-            }),
-          );
-        }
+        // 개별 ICE 후보 전송하지 않음 (대신 SDP에 포함시킴)
       };
 
       // 연결 상태 변경 이벤트 처리
@@ -379,7 +387,8 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _isConnected = false;
       _remoteDescriptionSet = false;
-      _candidateBuffer.clear();
+      _isGatheringIceCandidates = false;
+      _iceGatheringComplete = false;
       _connectionStatus = '재연결 중...';
       _errorLog = '';
     });
