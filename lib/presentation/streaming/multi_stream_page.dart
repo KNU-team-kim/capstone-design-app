@@ -1,26 +1,41 @@
 import 'package:capstone_design_app/presentation/streaming/stream_component.dart';
+import 'package:capstone_design_app/presentation/streaming/stream_provider.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-class MultiStreamPage extends StatefulWidget {
+class MultiStreamPage extends ConsumerStatefulWidget {
   const MultiStreamPage({super.key});
 
   @override
-  State<MultiStreamPage> createState() => _MultiStreamPageState();
+  ConsumerState<MultiStreamPage> createState() => _MultiStreamPageState();
 }
 
-class _MultiStreamPageState extends State<MultiStreamPage> {
+class _MultiStreamPageState extends ConsumerState<MultiStreamPage> {
   final List<String> _streamNames = const ['front', 'right', 'left', 'back'];
 
-  /// null  → 4-분할, 0‥3 → 해당 스트림 ‘확대’ 모드
-  int? _selectedIndex;
+  @override
+  void dispose() {
+    ref.read(streamsProvider.notifier).dispose();
+    super.dispose();
+  }
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(() {
+      ref.read(streamsProvider.notifier).connectAllStreams(_streamNames);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
+    final streamState = ref.watch(streamsProvider);
+    int? selectedIndex = streamState.focusedStreamIndex;
+    print(selectedIndex);
     // 확대 모드일 때 화면 구성 ---------------------------------------------
-    if (_selectedIndex != null) {
-      final bigName   = _streamNames[_selectedIndex!];
+    if (selectedIndex != null) {
+      final bigName   = _streamNames[selectedIndex];
       final smallList = [
-        for (int i = 0; i < _streamNames.length; i++) if (i != _selectedIndex) i
+        for (int i = 0; i < _streamNames.length; i++) if (i != selectedIndex) i
       ];
 
       return Scaffold(
@@ -30,7 +45,7 @@ class _MultiStreamPageState extends State<MultiStreamPage> {
             // 큰 영상
             Expanded(
               child: GestureDetector(
-                onTap: () => setState(() => _selectedIndex = null),
+                onTap: () => ref.read(streamsProvider.notifier).setFocusedStream(null),
                 child: WebRTCView(
                   key: ValueKey(bigName),
                   streamName: bigName,
@@ -51,7 +66,7 @@ class _MultiStreamPageState extends State<MultiStreamPage> {
                   return AspectRatio(
                     aspectRatio: 16 / 9,
                     child: GestureDetector(
-                      onTap: () => setState(() => _selectedIndex = i),
+                      onTap: () => ref.read(streamsProvider.notifier).setFocusedStream(i),
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8),
                         child: WebRTCView(
@@ -82,7 +97,7 @@ class _MultiStreamPageState extends State<MultiStreamPage> {
         ),
         itemCount: _streamNames.length,
         itemBuilder: (context, i) => GestureDetector(
-          onTap: () => setState(() => _selectedIndex = i),
+          onTap: () => ref.read(streamsProvider.notifier).setFocusedStream(i),
           child: WebRTCView(
             key: ValueKey(_streamNames[i]),
             streamName: _streamNames[i],
